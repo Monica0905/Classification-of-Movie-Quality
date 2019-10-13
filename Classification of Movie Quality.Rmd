@@ -1,0 +1,411 @@
+---
+title: "Classification of Movie Quality"
+author: "Wenshu Yang"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(e1071)
+library(klaR)
+library(GGally)
+library(caret)
+library(NeuralNetTools)
+library(knitr)
+```
+
+
+# Part A: Introduction
+
+  A data set containing information of about 5000 movies, including features such as gross and budget, actors' facebook likes and the number of reviews, is used in this classification project. 
+  
+  The research goal is to classify the movies into four different classes of quality. The response variable is a categorical variable which comes from the IMDB scores of the movies. Movies with 0-4 IMDB scores are categorized as "poor"; those with 4-6 scores are categorized as "fair"; those with 6-8 are "good"; and those with 8-10 are "excellent".
+  
+  The feature space considers all the variables in the data set except imdb_score and the variables with text such as the name of the actors which cannot be transformed into binary ones. As for the classification algorithms, three methods including Naive Bayes, support vector machine,  and neural network are applied.
+
+  The data source is the IMDB 5000 Movie Dataset [IMDB 5000 Movie Dataset]https://www.mozilla.org.
+                        
+                             
+                                      
+# Part B: Data Exploration and Preprocessing
+
+## 1. Simple data cleaning
+```{r}
+# Get the data
+movie <- read.csv("D:/NYU/COURSE/Materials/2019 Spring/2011 Supervised and Unsupervised Machine Learning/HW & Project Assignments/Projects/Project2/movie_metadata.csv", header = TRUE)
+
+# Remove duplicates
+movie <- movie[!duplicated(movie), ]
+
+# Remove text variables such as names and titles
+movie <- movie %>% dplyr::select(-c(director_name, actor_2_name, actor_1_name, movie_title, actor_3_name, plot_keywords, movie_imdb_link, genres))
+
+nrow(movie) # 4998 obs in the data set after removing duplications
+
+# Convert title year into the number of years relative to the baseline earliest year
+movie$title_year <- movie$title_year - min(movie$title_year, na.rm = TRUE)
+```
+
+## 2. Correlation between features
+```{r, warning=FALSE}
+# Correlation heat map
+ggcorr(movie, label = TRUE, label_round = 2, label_size = 2, size = 3, hjust = 0.85) +
+  ggtitle("Correlation Heatmap") +
+  theme(plot.title = element_text(hjust = 0.3))
+```
+
+  The correlation heat map shows that most of the features are not highly correlated, except "actor_1_facebook_likes" and "cast_total_facebook_likes". These two features have a correlation up to 0.95. Another two features that are quite correlated are the number of user for reviews and the number of voted users.
+
+
+## 3. Exploration of continuous variables
+
+### Density plots
+```{r}
+movie.continous <- dplyr::select(movie, -c(color, language, country, content_rating, imdb_score, facenumber_in_poster, aspect_ratio, title_year))
+
+# Density plots of continuous variables
+par(mfrow = c(2, 2))
+for (i in 1:ncol(movie.continous)) {
+  plot(density(movie.continous[, i], na.rm = TRUE), main = colnames(movie.continous)[i])
+} # All of them are highly right skewed
+par(mfrow = c(1, 1))
+
+# Take log of all the above continuous variables except facebook likes 
+movie$num_critic_for_reviews <- log(movie$num_critic_for_reviews)
+movie$num_voted_users <- log(movie$num_voted_users)
+movie$num_user_for_reviews <- log(movie$num_user_for_reviews)
+movie$gross <- log(movie$gross)
+movie$budget <- log(movie$budget)
+movie$duration <- log(movie$duration)
+```
+
+  The univariate density plots of the continuous variables show that all of them are highly right skewed. Therefore, these variables should be transformed by taking log of them. 
+
+### 0s in facebook likes
+```{r}
+## 0s in some variables (facebook likes) look like missing values
+apply(movie.continous, 2, function(x) sum(as.numeric(x)==0, na.rm = TRUE))
+  # movie_facebook_likes and director_facebook_likes have lots of 0s (2162, 897)
+
+# delete director_facebook_likes and movie_facebook_likes
+movie <- dplyr::select(movie, -c(director_facebook_likes, movie_facebook_likes)) 
+
+# Remove 0s in other facebook likes, and take log of them
+fb <- dplyr::select(movie, ends_with("facebook_likes"))
+fb0.row <- apply(fb, 1, function(x) any(x==0))
+
+fb <- log(fb[!fb0.row, ])
+movie <- movie[!fb0.row, ]
+
+movie <- movie %>% dplyr::select(-ends_with("facebook_likes"))
+movie <- cbind(movie, fb)
+```
+
+  All of the continuous variables except those measuring facebook likes have no 0 values, so taking log of them will not generate negative infinite values. As for the 6 variables of different kinds of facebook likes, the 0 values seem to be missing values actually. For example, some famous directors such as James Cameron have 0 facelikes in the data set, which is not the case in the truth. These 0s should be treated as missing values and removed before taking log of the variables. 
+  
+  What's more, the variables of director facebook likes and movie facebook likes have a large number of 0 values, which is respectively 2162 and 897. The number still remains large after removing NAs for all the other variables. As a result, keeping them in the feature space after removing their 0 values would make the remaining data set become just a small subset of the whole data set and damage the predictive power. Therefore, these two variables are removed from the feature space.
+
+### Density plots after taking log
+```{r}
+# Density plots after data cleaning and transformation
+movie.continous <- dplyr::select(movie, -c(color, language, country, content_rating, imdb_score, facenumber_in_poster, aspect_ratio, title_year))
+d.list <- list()
+d.x <- vector()
+d.y <- vector()
+for (i in 1:8) {
+  d.list[[i]] <- density(movie.continous[, i], na.rm = TRUE)
+  d.x <- c(d.x, d.list[[i]]$x)
+  d.y <- c(d.y, d.list[[i]]$y)
+}
+plot(d.list[[1]], xlim = range(d.x), ylim = range(d.y), main = "Densities of Continuous Features")
+for (i in 2:8) {
+  lines(d.list[[i]], col = i)
+}
+legend('topright', legend = colnames(movie.continous)[1:8], col = 1:8, lty = 1, cex = 0.8, bty = "n")
+```
+
+ The plot above shows the densities of the continuous variables after data cleaning and transformation. The distributions of the variables become more symmetric after taking log. According to the plot, the variances of these variables differ a lot from each other, and they have very different scales and units of measurement. Therefore, it would be better to standardize these variables.
+
+
+
+## 4. Exploration of categorical variables
+
+```{r}
+# tables of categorical variables
+table(movie$color) # most are colored
+table(movie$color)["Color"]/sum(table(movie$color)) # 95.6% are colored
+table(movie$language) # most are in English
+table(movie$language)["English"]/sum(table(movie$language)) # 93.8% are in English
+table(movie$country) # most are in USA
+table(movie$country)["USA"]/sum(table(movie$country)) # 76.0% are in USA
+table(movie$content_rating) # some of the ratings have the same meaning
+
+
+# Convert categorical variables to binary ones coded -1/+1
+## country
+movie$country <- ifelse(movie$country=="USA", 1, -1)
+
+## rating
+rating.list <- list(rating.g = c("G", "TV-G"), rating.pg = c("PG", "GP", "M", "TV-PG"), rating.pg13 = c("PG-13", "TV-14"), rating.r = "R", rating.nc17 = c("NC-17", "TV-MA", "X"), rating.nr = c("Not Rated", "Unrated", "Approved", "Passed"), rating.y7 = "TV-Y7", rating.y = "TV-Y")
+ratings <- sapply(rating.list, function(x) ifelse(movie$content_rating %in% x, 1, -1))
+movie <- cbind(movie, ratings)
+### the number of movies with different ratings
+kable(colSums(ratings==1), col.names = "the number of movies", caption = "the number of movies with different ratings") 
+### Remove some rating binary variales with little variation
+movie <- dplyr::select(movie, -c(color, language, content_rating, rating.g, rating.nc17, rating.nr, rating.y, rating.y7))
+```
+  
+  The categorical variables are converted into binary ones. They are recoded as -1/+1 instead of 0/1 because adding some "space" between them would make them more similar to the standardized continuous variables which have values on both sides of 0.
+  
+  There are 4 categorical variables in the data set, including the color of the movie, the language, the country and the rating. The tables of the number of different categories in each variable shows that more than 90% of the movies are colored and in English. Therefore, the variables indicating color and language have little variation and should be removed. As for the country of the movie, most movies are from the US, which make up 76% of the sample. This variables is recoded as a binary one, with 1 indicating the US and -1 indicating other countries.
+  
+  The table of the ratings shows that some of the ratings in the data set actually have the same meaning. Therefore, ratings with the same definitions are categorized together, and each rating category is indicated by a newly created binary variable. The table of the number of movies with different ratings show that the binary variables of rating.g, rating.nc17, rating.nr, rating.y7 and rating.y have little variation, so they are dropped from the feature space.
+  
+
+## 5. Missing values
+
+```{r, warning=FALSE}
+# Missing values
+## the number of NAs in each variable
+num.na <- colSums(is.na(movie) | movie=="") #gross has largest number of NAs (830)
+kable(num.na, col.names = "the number of misssing values")
+
+## remove all the rows with NAs
+na.row <- apply(movie, 1, function(x) any(is.na(x) | x=="")) #1261 rows with NAs
+movie <- movie[!na.row, ] # 3736 obs
+```
+
+  The table of the number of missing values in each variable shows that the variable of gross has the largest number of missing values, which is 830. This accounts for 17% of the whole data set. Another variable which also have lots of missing values is the budget, with missing values accounting for 10% of the data. This is not a terrible case because the other variables do not have many missing values. So these variables are kept in the data set. After removing the missing values in all the variables, we have 3736 observations left.
+
+
+## 6. Response variable
+
+```{r}
+# Histogram of IMDB scores
+hist(movie$imdb_score, xlab = "IMDB score", main = "Histogram of IMDB scores")
+
+# Convert response variable (IMDB score) into 4 categories
+movie$quality <- cut(movie$imdb_score, c(0, 4, 6, 8, 10), labels = c("poor", "fair", "good", "excellent"))
+movie <- dplyr::select(movie, -imdb_score)
+table(movie$quality)
+```
+
+  The above histogram of the IMDB scores shows that the scores of most movies lie in the range of 6 to 8. There is only a small number of movies that have an IMDB score lower than 4. The response variable of classification, the quality, is created based on the IMDB score. Movies with IMDB scores between 0-4 is categorized as "poor"; those with 4-6 scores is categorized as "fair"; those with 6-8 scores are categorized as "good"; and those with 8-10 scores are categorizes with "excellent". The intervels are closed on the right and open on the left.
+
+
+## 7. Standardization
+
+```{r}
+movie.std <- movie
+movie.std[, 1:(ncol(movie)-1)] <- scale(movie[, 1:(ncol(movie)-1)])
+movie.std <- movie.std %>% dplyr::select(-c(quality, country, rating.pg, rating.pg13, rating.r, quality)) %>% dplyr::mutate(country=movie$country, rating.pg=movie$rating.pg, rating.pg13=movie$rating.pg13, rating.r=movie$rating.r, quality=movie$quality)
+
+# Density plots of standardized continuous data
+movie.std.continous <- dplyr::select(movie.std, -c(quality, facenumber_in_poster, aspect_ratio, title_year))
+
+d.list <- list()
+d.x <- vector()
+d.y <- vector()
+for (i in 1:8) {
+  d.list[[i]] <- density(movie.std.continous[, i])
+  d.x <- c(d.x, d.list[[i]]$x)
+  d.y <- c(d.y, d.list[[i]]$y)
+}
+plot(d.list[[1]], xlim = range(d.x), ylim = range(d.y), main = "Densities of 8 Continuous Features after Standardization")
+for (i in 2:8) {
+  lines(d.list[[i]], col = i)
+}
+legend('topleft', legend = colnames(movie.std.continous)[1:8], col = 1:8, lty = 1, cex = 0.8, bty = "n")
+
+# Density plot of budget
+plot(d.list[[6]], col = 6, main = paste("Density of ", colnames(movie.std.continous)[6]))
+```
+
+  All the continuous variables are standardized after data cleaning and log transformation. Standardization is to avoid some variables with large variances dominating the distance calculation and principal components. The binary variables are coded as -1/+1 in the feature set and not standardized.
+  
+  The density plot of the standardized continuous variables show that the variables are of similar scales after standardization. But there are still long tails in the densities. What's more, some of the densities are not smooth enough. For example, the density plot of budget have some "extreme values" less than -6 or greater than 4. Accordingly, there might be a lot of outliers which lie out of the range of 3 standard deviations from the 0 mean. 
+
+
+## 8. Principal Components
+
+### Bivariate plot of PCs
+```{r}
+# PC of Standardized data
+pc.std <- princomp(dplyr::select(movie.std, -quality))
+pairs(pc.std$scores[, 1:5], col = movie$quality)
+
+movie.std.pc <- as.data.frame(pc.std$scores)
+movie.std.pc$quality <- movie.std$quality
+```
+
+  Above is the bivariate plot of the first five principal components of the standardized data, colored by different classes of the movies. The plot shows that the points with different colors are hard to separate, indicating that it may be hard to get high accuracy in the classification. 
+
+
+### Density plot of PCs
+```{r}
+# Density plot of principal components 1-8 within different classes
+par(mfrow = c(2, 2))
+
+pc.d.fun <- function(n) {
+  quality <- c("poor", "fair", "good", "excellent")
+  d.list <- list()
+  d.x <- vector()
+  d.y <- vector()
+  for (i in 1:4) {
+    d.list[[i]] <- density(pc.std$scores[,n][movie$quality==quality[i]])
+    d.x <- c(d.x, d.list[[i]]$x)
+    d.y <- c(d.y, d.list[[i]]$y)
+  }
+  plot(d.list[[1]], xlim = range(d.x), ylim = range(d.y), main = paste("Densities of Comp.", n))
+  for (i in 2:4) {
+    lines(d.list[[i]], col = i)
+  }
+  legend('topleft', legend = quality, col = 1:4, lty = 1, cex = 0.8, bty = "n", y.intersp = 0.2)
+}
+
+sapply(1:8, pc.d.fun)
+par(mfrow = c(1, 1))
+```
+
+  Above is the density plots  of the first 8 principal components conditional on the four different classes. It is shown that the densities of the four groups have lots of overlaps, although it seems in the plots of component 1 and component 2 that movies with higher quality may have slightly higher values in these two components. The density plots indicates that the movies are hard to classify, which is also shown in the bivariate plots. 
+  
+  The plots of components 4-8 also show that the densities of these components for the group of "good" have a very long tail, but the density values are nearly 0 on the tail. This may be an evidence of outliers in the group of "good" movies.
+
+
+
+# Part C: Classification Methods
+
+  Three classification methods, which are naive bayes, support vector machine and neural network, are implemented to classify the movies. In order to mitigate the problem of overfitting, 70% of the data is randomly sampled for training the model, and the remaining 30% is only used for testing. Within the training data, 10-fold cross validation is applied for choosing the "best" parameters for each model to get the largest out-of-sample accuracy.
+
+## 1. Naive Bayes
+
+  The first method is Naive Bayes classifier. The cross validation within the training data set is repeated 20 times.
+  
+  The assumption of this algorithm requires that the features are independent given the class. In order to satify this assumption by removing the correlation between the features, the principal components instead of the original data are used in the model. The results are shown as follows.
+
+```{r}
+set.seed(2011)
+idx <- createDataPartition(y=movie.std$quality, p=0.7, list=FALSE)
+train.control <- trainControl(method = "repeatedcv", number = 10, repeats = 20)
+
+movie.std.pc.train <- movie.std.pc[idx, ]
+movie.std.pc.test <- movie.std.pc[-idx, ]
+
+# Similar proportion of each class within training and testing set
+class.prop <- round(rbind(table(movie.std.pc.train$quality)/nrow(movie.std.pc.train), table(movie.std.pc.test$quality)/nrow(movie.std.pc.test)), 4)
+rownames(class.prop) <- c("train", "test")
+class.prop
+```
+
+```{r, warning=FALSE}
+# all PCs
+nb.fit.cv <- train(quality~., data = movie.std.pc.train, trControl = train.control, method = "nb")
+print(nb.fit.cv, showSD = TRUE) #accuracy=0.6765672
+pred.nb.cv <- predict(nb.fit.cv, newdata = movie.std.pc.test)
+print(cm.nb <- confusionMatrix(pred.nb.cv, movie.std.pc.test$quality)) #accuracy=0.6702
+acc.nb.train <- 0.6765672 #save the accuracy
+acc.nb.test <- 0.6702 
+```
+
+  The cross validation process picks the parameters of fL = 0, useKernel = TRUE, and adjust = 1. The Naive Bayes classifier does not achive high accuracy in both the traning and the testing sample. The average within training accuracy on the CV sample is 67.7%. Within the test set, the accuracy is 67%. The low accuracy seems to be consistent with the difficulty of separating the points shown in the bivariate plots.
+  
+  When applying this method in R, more than 50 warnings of 0 probabilities for all classes occurred. (These warnings are set not to be shown in the final PDF report because they would take up too much space.) This may be because Naive Bayes model builds empirical densities conditional on groups. When there are lots of outliers in the data set, and the density plots are not smooth enough, 0 probabilities of all classes may occur for some observations. As the density plots show, the densities of some features and the principal components 4-8 have long tails with values close to 0. The bivariate plots of the components also show that there are outliers in components 4 and 5. This might lead to 0 probabilities for some observations to be classified into any of the four classes.
+  
+  To further confirm this, the following Naive Bayes model uses only component 1-3. In this case, there are only 9 warnings when running the model codes, which is much fewer than those in the previous model with all of the components. There is still little accuracy probably because the first three components contribute only 54.5% of variance of the whole feature set. When looking closely at the confusion matrix, the prediction looks poor too, which classifies most of the movies into one category, the "good" one. The true positive rate is only high for the class "good", and is very low for the other three classes.
+
+```{r}
+set.seed(2011)
+idx <- createDataPartition(y=movie.std$quality, p=0.7, list=FALSE)
+train.control <- trainControl(method = "repeatedcv", number = 10, repeats = 20)
+
+# PC 1-3
+nb.fit.cv1 <- train(quality~Comp.1+Comp.2+Comp.3, data = movie.std.pc.train, trControl = train.control, method = "nb") #9 warnings
+print(nb.fit.cv1, showSD = TRUE) #accuracy=0.6757983
+pred.nb.cv1 <- predict(nb.fit.cv1, newdata = movie.std.pc.test)
+print(cm.nb1 <- confusionMatrix(pred.nb.cv1, movie.std.pc.test$quality)) #accuracy=0.6711
+
+# Summary of the components
+summary(pc.std)
+```
+
+
+## 2. Support Vector Machine
+
+  Another method used for classification is support vector machine. The cross validation process is also repeated 20 times to search for the best parameters. Radial kernel is used in this SVM model. The results are shown as follows.
+
+```{r}
+set.seed(2011)
+idx <- createDataPartition(y=movie.std$quality, p=0.7, list=FALSE)
+train.control <- trainControl(method = "repeatedcv", number = 10, repeats = 20)
+
+movie.std.train <- movie.std[idx, ]
+movie.std.test <- movie.std[-idx, ]
+
+# linear
+svm.fit.cv <- train(quality~., data = movie.std.train, trControl = train.control, method = "svmRadial")
+print(svm.fit.cv, showSD = TRUE) #accuracy=0.7494268
+pred.svm.cv <- predict(svm.fit.cv, newdata = movie.std.test)
+print(cm.svm <- confusionMatrix(pred.svm.cv, movie.std.test$quality)) #accuracy=0.7355
+acc.svm.train <- 0.7494268 #save the accuracy
+acc.svm.test <- 0.7355
+```
+
+  The cross validation process chooses the best parameters as gamma = 0.04548044 and C = 1. The average within training accuracy on the CV sample is 74.9%. Within the test set, the accuracy is similar, which is 73.6%. 
+  
+  The confusion matrix shows that the prediction of the class "poor" is very inaccurate. None of the movies in this group are classified correctly. This may be due to the small number of movies with low IMDB scores in the data set. Only approximately 2% of the movies are in the group of "poor".
+
+
+## 3. Neural Network
+
+  For the neural network model, the parameter set is too large to use cross validation. However, cross validation can be used for choosing a few of the tuning parameters. One of the parameters is "decay", which performs a penalty to aviod overfitting. In this case, the cross validation is applied just once because repeated cross validation would be very computationally expensive, and the tuning parameters are set to be in a larger grid than the default. The parameters are searched through a grid with sizes 1-9 and weight decay between 0 and 0.1 by 0.025, as well as testing 0.01 (a total of 6 values for decay).
+  
+  
+
+```{r}
+set.seed(2011)
+idx <- createDataPartition(y=movie.std$quality, p=0.7, list=FALSE)
+movie.std.train <- movie.std[idx, ]
+movie.std.test <- movie.std[-idx, ]
+trControl <- trainControl(method = "cv", number = 10, search = "grid")
+tuneGrid <- expand.grid(.size = c(1:9), .decay = c(0, 0.025, 0.05, 0.075, 0.1,
+0.01))
+
+text.nn.movie.std <- capture.output(nn.fit.cv <- caret::train(quality ~ ., data = movie.std.train, method = "nnet", metric = "Accuracy", trControl = trControl, importance = TRUE, tuneGrid = tuneGrid))
+pred.nn.cv <- predict(nn.fit.cv, movie.std.test)
+print(nn.fit.cv, showSD = TRUE) #accuracy=0.7596560 
+print(cm.nn <- confusionMatrix(pred.nn.cv, movie.std.test$quality)) #0.7462
+acc.nn.train <- 0.7596560 #save the accuracy
+acc.nn.test <- 0.7462
+```
+
+```{r}
+# Visualization of the neural network
+par(mar = numeric(4), family = "serif")
+plotnet(nn.fit.cv$finalModel, cex_val = 0.5)
+```
+
+  The best parameter set (decay, size) selected by cross validation is (7, 0.1). The average within training accuracy on the CV sample is 76.0%. Within the test set, the accuracy is 74.6%. The confusion matrix and the sensitivity also show that the classification does not perform well in the group "poor", which is also the case in the SVM results.
+
+
+## 4. Comparison of the three methods
+
+```{r}
+compare <- data.frame(NB = c(acc.nb.train, acc.nb.test), SVM = c(acc.svm.train, acc.svm.test), NN = c(acc.nn.train, acc.nn.test))
+rownames(compare) <- c("training", "testing")
+compare
+```
+  
+  The classification accuracy within the training set and the testing set with the three models is shown in the table above. Generally speaking, the three models provide similar results. All of them does not achieve good accuracy. Considering the density plots and the bivariate plots, the data points themselves may be hard to classify, to some extent accounting for the low accuracy of the classification.
+  
+  Compared to the Naive Bayes classifier, the support vector machine and the neural net model have slightly higher accuracy within both the CV training set and the test set. This might be due to the the large number of observations with 0 probabilities for all classes when applying the Naive Bayes model.
+  
+  Neural net has similar performance with support vector machine. Although the accuracy seems a little higher for the neural net, the difference is not significant.
+  
+  
+
+# Part D: Conclusion
+  
+  Three classification models including Naive Bayes, support vector machine and neural network are applied to classify the movies into 4 categories of quality based on IMDB scores. High accuracy is not achieved for all of the three methods. This is probably beacuse the movies themselves are hard to classify using the available features. What's more, the outliers in the data set might also affects the accuracy of classification. In addition, the sensitivity shows that all of the three methods do not predict well for the group of "poor", but perform better in classifying the group of "good".
+  
+  
+
